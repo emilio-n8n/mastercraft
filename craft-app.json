@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "mastercraft",
+  "name": "MasterCraft",
+  "tagline": "Audio restoration with waveform editing and WAV export",
+  "repo": "emilio-n8n/mastercraft",
+  "publisher": "emilio-n8n",
+  "upstream": null,
+  "bundle_id": "io.github.emilion8n.mastercraft",
+  "msi_publisher": "emilio-n8n",
+  "apple_team": null,
+  "website": "https://github.com/emilio-n8n/mastercraft",
+  "color": "#e0a33a",
+  "icon": "mastercraft-128.png"
+}
