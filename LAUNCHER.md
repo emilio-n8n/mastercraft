@@ -56,7 +56,7 @@ Each release should attach:
 
 - archives named `<id>-<version>-<os>-<arch>.<ext>`:
   - `mastercraft-<version>-linux-x86_64.tar.gz` or `.AppImage` / `.deb` / `.rpm`
-  - `mastercraft-<version>-windows-x64.zip` or `.msi`
+  - `mastercraft-<version>-windows-x64-portable.zip` or `.msi`
   - `mastercraft-<version>-macos-aarch64.dmg` / `macos-x86_64.dmg`
 - `craft-app.json`
 - `mastercraft-128.png`
