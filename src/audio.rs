@@ -8,15 +8,90 @@ use std::fmt;
 use std::path::Path;
 
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
+use serde::{Deserialize, Serialize};
 
 /// Number of samples processed between progress/cancellation checks.
 const CHUNK_SAMPLES: usize = 16_384;
+
+/// WAV encoding chosen when exporting a buffer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExportFormat {
+    /// 32-bit IEEE float, lossless round trip for normalised samples.
+    #[default]
+    Float32,
+    /// 16-bit signed PCM, broadly compatible with audio players.
+    Pcm16,
+}
+
+impl ExportFormat {
+    /// Human-readable label used by the UI.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Float32 => "Float 32-bit",
+            Self::Pcm16 => "PCM 16-bit",
+        }
+    }
+}
+
+/// A half-open frame range `start..end` selected on the waveform.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Selection {
+    /// First selected frame.
+    pub start: usize,
+    /// One past the last selected frame.
+    pub end: usize,
+}
+
+impl Selection {
+    /// Build a selection, swapping inverted endpoints.
+    #[must_use]
+    pub fn new(first: usize, second: usize) -> Self {
+        Self {
+            start: first.min(second),
+            end: first.max(second),
+        }
+    }
+
+    /// Clamp both endpoints to a buffer of `frames` frames.
+    #[must_use]
+    pub fn clamped(self, frames: usize) -> Self {
+        Self {
+            start: self.start.min(frames),
+            end: self.end.clamp(self.start.min(frames), frames),
+        }
+    }
+
+    /// Number of selected frames.
+    #[must_use]
+    pub fn len(self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+
+    /// Whether the selection is empty.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    /// Selection duration in seconds at `sample_rate`.
+    #[must_use]
+    pub fn duration(self, sample_rate: u32) -> f64 {
+        if sample_rate == 0 {
+            0.0
+        } else {
+            self.len() as f64 / f64::from(sample_rate)
+        }
+    }
+}
 
 /// Errors produced while reading or writing WAV files.
 #[derive(Debug)]
 pub enum AudioError {
     /// The WAV container could not be read or written.
     Hound(hound::Error),
+    /// The file could not be opened or its metadata read.
+    Io(std::io::Error),
     /// The file uses a sample format that this build cannot decode.
     Unsupported(String),
 }
@@ -25,6 +100,7 @@ impl fmt::Display for AudioError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Hound(error) => write!(formatter, "WAV error: {error}"),
+            Self::Io(error) => write!(formatter, "File error: {error}"),
             Self::Unsupported(reason) => write!(formatter, "Unsupported WAV format: {reason}"),
         }
     }
@@ -34,6 +110,7 @@ impl std::error::Error for AudioError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Hound(error) => Some(error),
+            Self::Io(error) => Some(error),
             Self::Unsupported(_) => None,
         }
     }
@@ -42,6 +119,12 @@ impl std::error::Error for AudioError {
 impl From<hound::Error> for AudioError {
     fn from(error: hound::Error) -> Self {
         Self::Hound(error)
+    }
+}
+
+impl From<std::io::Error> for AudioError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
     }
 }
 
@@ -94,15 +177,38 @@ impl AudioBuffer {
     ///
     /// Returns an error when the file cannot be created or written.
     pub fn write_wav(&self, path: impl AsRef<Path>) -> Result<(), AudioError> {
+        self.write_wav_with_format(path, ExportFormat::Float32)
+    }
+
+    /// Encode this buffer using the requested WAV format.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be created or written.
+    pub fn write_wav_with_format(
+        &self,
+        path: impl AsRef<Path>,
+        format: ExportFormat,
+    ) -> Result<(), AudioError> {
         let spec = WavSpec {
             channels: self.channels,
             sample_rate: self.sample_rate,
-            bits_per_sample: 32,
-            sample_format: SampleFormat::Float,
+            bits_per_sample: match format {
+                ExportFormat::Float32 => 32,
+                ExportFormat::Pcm16 => 16,
+            },
+            sample_format: match format {
+                ExportFormat::Float32 => SampleFormat::Float,
+                ExportFormat::Pcm16 => SampleFormat::Int,
+            },
         };
         let mut writer = WavWriter::create(path, spec)?;
         for &sample in &self.samples {
-            writer.write_sample(clamp_sample(sample))?;
+            let clamped = clamp_sample(sample);
+            match format {
+                ExportFormat::Float32 => writer.write_sample(clamped)?,
+                ExportFormat::Pcm16 => writer.write_sample(sample_to_i16(clamped))?,
+            }
         }
         writer.finalize()?;
         Ok(())
@@ -124,21 +230,34 @@ impl AudioBuffer {
         self.frames() as f64 / f64::from(self.sample_rate)
     }
 
-    /// Compute `(min, max)` per column of the waveform.
+    /// Compute `(min, max)` per column of the whole waveform.
+    #[must_use]
+    pub fn waveform(&self, columns: usize) -> Vec<(f32, f32)> {
+        let frames = self.frames();
+        self.waveform_range(0, frames, columns)
+    }
+
+    /// Compute `(min, max)` per column for a frame range (zoom viewport).
     ///
     /// All channels of a frame contribute to its column. Empty columns return
     /// `(0.0, 0.0)`, which draws as a flat line.
     #[must_use]
-    pub fn waveform(&self, columns: usize) -> Vec<(f32, f32)> {
+    pub fn waveform_range(
+        &self,
+        start_frame: usize,
+        end_frame: usize,
+        columns: usize,
+    ) -> Vec<(f32, f32)> {
         if columns == 0 {
             return Vec::new();
         }
-        let frames = self.frames();
+        let (first_frame, last_frame) = self.frame_range(start_frame, end_frame);
+        let frames = last_frame - first_frame;
         let channels = self.channels.max(1) as usize;
         let mut peaks = Vec::with_capacity(columns);
         for column in 0..columns {
-            let first = frames * column / columns;
-            let last = frames * (column + 1) / columns;
+            let first = first_frame + frames * column / columns;
+            let last = first_frame + frames * (column + 1) / columns;
             let mut min = f32::INFINITY;
             let mut max = f32::NEG_INFINITY;
             for frame in first..last {
@@ -174,24 +293,113 @@ impl AudioBuffer {
         &mut self,
         gain_db: f32,
         normalize: bool,
+        on_chunk: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(f32) -> Result<(), String>,
+    {
+        let frames = self.frames();
+        self.apply_gain_range(gain_db, normalize, 0, frames, on_chunk)
+    }
+
+    /// Apply gain or normalisation to a frame range only.
+    ///
+    /// Normalisation uses the peak of the selected range, not of the whole
+    /// buffer. Progress is reported for the processed part of the buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error produced by `on_chunk`.
+    pub fn apply_gain_range<F>(
+        &mut self,
+        gain_db: f32,
+        normalize: bool,
+        start_frame: usize,
+        end_frame: usize,
         mut on_chunk: F,
     ) -> Result<(), String>
     where
         F: FnMut(f32) -> Result<(), String>,
     {
+        let (from, to) = self.byte_range(start_frame, end_frame);
         let multiplier = if normalize {
-            normalization_multiplier(&self.samples)
+            normalization_multiplier(&self.samples[from..to])
         } else {
             gain_multiplier(gain_db)
         };
-        let total = self.samples.len();
+        let total = to - from;
         let mut done = 0;
-        for chunk in self.samples.chunks_mut(CHUNK_SAMPLES) {
+        for chunk in self.samples[from..to].chunks_mut(CHUNK_SAMPLES) {
             process_chunk(chunk, multiplier);
             done += chunk.len();
             on_chunk(done as f32 / total as f32)?;
         }
         Ok(())
+    }
+
+    /// Keep only the selected frames, returning a new buffer.
+    #[must_use]
+    pub fn trim(&self, start_frame: usize, end_frame: usize) -> Self {
+        let (from, to) = self.byte_range(start_frame, end_frame);
+        Self {
+            samples: self.samples[from..to].to_vec(),
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+        }
+    }
+
+    /// Replace a frame range with silence.
+    pub fn silence_range(&mut self, start_frame: usize, end_frame: usize) {
+        let (from, to) = self.byte_range(start_frame, end_frame);
+        for sample in &mut self.samples[from..to] {
+            *sample = 0.0;
+        }
+    }
+
+    /// Apply a linear fade-in or fade-out across a frame range.
+    ///
+    /// `fade_frames` is clamped to the range length. A fade-in ramps from 0 to
+    /// 1 over the first frames; a fade-out ramps from 1 to 0 over the last.
+    /// The rest of the range is left untouched.
+    pub fn fade_range(
+        &mut self,
+        start_frame: usize,
+        end_frame: usize,
+        fade_frames: usize,
+        fade_in: bool,
+    ) {
+        let channels = self.channels.max(1) as usize;
+        let (from_frame, to_frame) = self.frame_range(start_frame, end_frame);
+        let length = to_frame - from_frame;
+        let fade = fade_frames.min(length);
+        for index in 0..fade {
+            let frame = if fade_in {
+                from_frame + index
+            } else {
+                to_frame - fade + index
+            };
+            let factor = if fade_in {
+                (index + 1) as f32 / fade as f32
+            } else {
+                (fade - index) as f32 / fade as f32
+            };
+            let first = frame * channels;
+            for sample in &mut self.samples[first..first + channels] {
+                *sample *= factor;
+            }
+        }
+    }
+
+    fn frame_range(&self, start_frame: usize, end_frame: usize) -> (usize, usize) {
+        let frames = self.frames();
+        let start = start_frame.min(frames);
+        (start, end_frame.clamp(start, frames))
+    }
+
+    fn byte_range(&self, start_frame: usize, end_frame: usize) -> (usize, usize) {
+        let channels = self.channels.max(1) as usize;
+        let (start, end) = self.frame_range(start_frame, end_frame);
+        (start * channels, end * channels)
     }
 
     /// A deterministic sine wave for the `--sample` startup mode.
@@ -300,6 +508,84 @@ pub fn process_chunk(samples: &mut [f32], multiplier: f32) {
 
 fn clamp_sample(sample: f32) -> f32 {
     sample.clamp(-1.0, 1.0)
+}
+
+fn sample_to_i16(sample: f32) -> i16 {
+    let scaled = (clamp_sample(sample) * 32_768.0).round();
+    if scaled >= 32_767.0 {
+        32_767
+    } else if scaled <= -32_768.0 {
+        -32_768
+    } else {
+        scaled as i16
+    }
+}
+
+/// Decode a WAV file while reporting byte-based progress.
+///
+/// Used by the background loading job so large files never block the UI. The
+/// callback may return an error to cancel the read.
+///
+/// # Errors
+///
+/// Returns an error for unreadable files, malformed containers or when the
+/// callback cancels.
+pub fn load_wav_with_progress<F>(
+    path: impl AsRef<Path>,
+    mut on_progress: F,
+) -> Result<AudioBuffer, AudioError>
+where
+    F: FnMut(f32) -> Result<(), String>,
+{
+    let file = std::fs::File::open(path)?;
+    let total = file.metadata()?.len().max(1);
+    let mut reader = ProgressReader {
+        inner: std::io::BufReader::new(file),
+        bytes_read: 0,
+        total,
+        on_progress: &mut on_progress,
+        last_report: 0,
+    };
+    let mut wav = WavReader::new(&mut reader)?;
+    let spec = wav.spec();
+    if spec.channels == 0 {
+        return Err(AudioError::Unsupported("zero channels".to_owned()));
+    }
+    if spec.sample_rate == 0 {
+        return Err(AudioError::Unsupported("zero sample rate".to_owned()));
+    }
+    let mut samples = Vec::with_capacity(wav.len() as usize);
+    read_samples(&mut wav, &spec, &mut samples)?;
+    on_progress(1.0).map_err(AudioError::Unsupported)?;
+    Ok(AudioBuffer {
+        samples,
+        sample_rate: spec.sample_rate,
+        channels: spec.channels,
+    })
+}
+
+struct ProgressReader<'a, F> {
+    inner: std::io::BufReader<std::fs::File>,
+    bytes_read: u64,
+    total: u64,
+    on_progress: &'a mut F,
+    last_report: u64,
+}
+
+impl<F> std::io::Read for ProgressReader<'_, F>
+where
+    F: FnMut(f32) -> Result<(), String>,
+{
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.bytes_read += read as u64;
+        if self.bytes_read - self.last_report >= 64 * 1024 {
+            self.last_report = self.bytes_read;
+            let fraction = (self.bytes_read as f32 / self.total as f32).min(1.0);
+            (self.on_progress)(fraction).map_err(std::io::Error::other)?;
+        }
+        Ok(read)
+    }
 }
 
 #[cfg(test)]
@@ -445,6 +731,102 @@ mod tests {
         assert_eq!(a.frames(), 88_200);
         assert!((a.duration() - 2.0).abs() < 1e-6);
         assert!(a.samples.iter().all(|sample| sample.abs() <= 0.5 + 1e-6));
+    }
+
+    #[test]
+    fn selection_normalizes_and_clamps() {
+        assert_eq!(Selection::new(7, 3), Selection { start: 3, end: 7 });
+        assert_eq!(
+            Selection { start: 4, end: 99 }.clamped(10),
+            Selection { start: 4, end: 10 }
+        );
+        assert_eq!(Selection { start: 2, end: 6 }.len(), 4);
+        assert!(Selection { start: 2, end: 2 }.is_empty());
+        assert!(
+            (Selection {
+                start: 0,
+                end: 22_050
+            }
+            .duration(44_100)
+                - 0.5)
+                .abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
+    fn trim_keeps_only_selected_frames() {
+        let audio = buffer(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2);
+        let trimmed = audio.trim(1, 3);
+        assert_eq!(trimmed.samples, vec![3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(trimmed.channels, 2);
+        assert_eq!(trimmed.sample_rate, 48_000);
+        assert_eq!(audio.trim(0, 99).samples, audio.samples);
+    }
+
+    #[test]
+    fn fade_in_and_out_ramp_linearly() {
+        let mut audio = buffer(&[1.0, 1.0, 1.0, 1.0, 1.0], 1);
+        audio.fade_range(0, 5, 3, true);
+        assert_eq!(audio.samples[0], 1.0 / 3.0);
+        assert_eq!(audio.samples[1], 2.0 / 3.0);
+        assert_eq!(audio.samples[2], 1.0);
+        assert_eq!(audio.samples[3], 1.0);
+
+        let mut audio = buffer(&[1.0, 1.0, 1.0, 1.0, 1.0], 1);
+        audio.fade_range(0, 5, 2, false);
+        assert_eq!(audio.samples[2], 1.0);
+        assert_eq!(audio.samples[3], 1.0);
+        assert_eq!(audio.samples[4], 0.5);
+    }
+
+    #[test]
+    fn gain_and_normalization_apply_only_to_selection() {
+        let mut audio = buffer(&[0.25, 0.5, 0.25, 0.5], 1);
+        audio
+            .apply_gain_range(6.0, false, 1, 3, |_| Ok(()))
+            .expect("range gain");
+        let multiplier = 10.0_f32.powf(6.0 / 20.0);
+        assert_eq!(audio.samples[0], 0.25);
+        assert!((audio.samples[1] - 0.5 * multiplier).abs() < 1e-6);
+        assert!((audio.samples[2] - 0.25 * multiplier).abs() < 1e-6);
+        assert_eq!(audio.samples[3], 0.5);
+
+        let mut audio = buffer(&[1.0, 0.25, 0.25, 1.0], 1);
+        audio
+            .apply_gain_range(0.0, true, 1, 3, |_| Ok(()))
+            .expect("range normalize");
+        assert_eq!(audio.samples[0], 1.0);
+        assert_eq!(audio.samples[1], 1.0);
+        assert_eq!(audio.samples[2], 1.0);
+        assert_eq!(audio.samples[3], 1.0);
+    }
+
+    #[test]
+    fn silence_range_zeroes_only_selection() {
+        let mut audio = buffer(&[0.5, 0.5, 0.5], 1);
+        audio.silence_range(1, 2);
+        assert_eq!(audio.samples, vec![0.5, 0.0, 0.5]);
+    }
+
+    #[test]
+    fn pcm16_export_round_trip() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("pcm16-export.wav");
+        let original = buffer(&[0.0, 0.5, -0.5, 1.0, -1.0], 1);
+
+        original
+            .write_wav_with_format(&path, ExportFormat::Pcm16)
+            .expect("write PCM16");
+        let spec = hound::WavReader::open(&path).expect("open").spec();
+        assert_eq!(spec.bits_per_sample, 16);
+        assert_eq!(spec.sample_format, hound::SampleFormat::Int);
+
+        let loaded = AudioBuffer::load_wav(&path).expect("read PCM16");
+        assert_eq!(loaded.sample_rate, original.sample_rate);
+        for (expected, actual) in original.samples.iter().zip(&loaded.samples) {
+            assert!((expected - actual).abs() < 1e-4, "{expected} vs {actual}");
+        }
     }
 
     #[test]

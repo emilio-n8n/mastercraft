@@ -4,7 +4,9 @@
 
 mod app;
 mod audio;
+mod batch;
 mod document;
+mod playback;
 
 use craftkit_ui::cli::{self, CliAction};
 use craftkit_ui::{WindowOptions, run_native};

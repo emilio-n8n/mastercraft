@@ -2,8 +2,11 @@
 //!
 //! Only editing settings are persisted. Audio samples live outside the JSON
 //! project file; see the `EditState` history in [`crate::app`] for the reason.
+//! New fields use `#[serde(default)]` so schema 1 files from v0.1.0 keep loading.
 
 use serde::{Deserialize, Serialize};
+
+use crate::audio::ExportFormat;
 
 /// The persisted part of a MasterCraft project.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -16,6 +19,9 @@ pub struct Document {
     pub gain_db: f32,
     /// Whether peak normalisation is enabled.
     pub normalize: bool,
+    /// WAV format used by the last export.
+    #[serde(default)]
+    pub export_format: ExportFormat,
 }
 
 impl Default for Document {
@@ -25,6 +31,7 @@ impl Default for Document {
             source_path: None,
             gain_db: 0.0,
             normalize: false,
+            export_format: ExportFormat::Float32,
         }
     }
 }
@@ -35,9 +42,7 @@ impl Document {
     pub fn sample() -> Self {
         Self {
             title: "MasterCraft demo".to_owned(),
-            source_path: None,
-            gain_db: 0.0,
-            normalize: false,
+            ..Self::default()
         }
     }
 }
@@ -53,6 +58,7 @@ mod tests {
             source_path: Some("audio/take-03.wav".to_owned()),
             gain_db: -3.5,
             normalize: true,
+            export_format: ExportFormat::Pcm16,
         };
         let json = serde_json::to_string(&document).expect("serialize");
         let decoded: Document = serde_json::from_str(&json).expect("deserialize");
@@ -66,6 +72,7 @@ mod tests {
         assert_eq!(document.source_path, None);
         assert_eq!(document.gain_db, 0.0);
         assert!(!document.normalize);
+        assert_eq!(document.export_format, ExportFormat::Float32);
     }
 
     #[test]
@@ -75,5 +82,15 @@ mod tests {
         assert!(json.contains("\"source_path\":null"));
         let decoded: Document = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, document);
+    }
+
+    #[test]
+    fn v0_1_schema_1_json_still_loads() {
+        let old = r#"{"title":"Old","source_path":null,"gain_db":-6.0,"normalize":true}"#;
+        let document: Document = serde_json::from_str(old).expect("migration");
+        assert_eq!(document.title, "Old");
+        assert_eq!(document.gain_db, -6.0);
+        assert!(document.normalize);
+        assert_eq!(document.export_format, ExportFormat::Float32);
     }
 }

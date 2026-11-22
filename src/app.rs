@@ -7,28 +7,29 @@ use craftkit_io::DocumentHost;
 use craftkit_jobs::JobRunner;
 use craftkit_ui::cli::CliOptions;
 use craftkit_ui::eframe::{self, egui};
-use craftkit_ui::egui::{Align, Layout, RichText, Stroke, Vec2, pos2};
+use craftkit_ui::egui::{Align, Layout, Rect, RichText, Stroke, Vec2, pos2};
 use craftkit_ui::{AppIdentity, AppShell, Tone, dialogs, theme, widgets};
 
-use crate::audio::AudioBuffer;
+use crate::audio::{AudioBuffer, ExportFormat, Selection, load_wav_with_progress};
+use crate::batch::{self, BatchPreset, BatchReport};
 use crate::document::Document;
+use crate::playback::{Playback, format_time};
 
 const FORMAT: &str = "mastercraft";
 const SCHEMA_VERSION: u32 = 1;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-const PROCESS_JOB: &str = "Apply gain";
+const LOAD_JOB: &str = "Load WAV";
+const PROCESS_JOB: &str = "Process audio";
+const BATCH_JOB: &str = "Batch process";
 
-/// Everything the user can edit, in one undo stack.
-///
-/// Audio samples are deliberately excluded from the JSON document, so they are
-/// kept here instead of in [`Document`]. Persisted fields are mirrored into the
-/// document before every save.
+/// Undoable editing state. Audio samples live here, not in the JSON project.
 #[derive(Clone, PartialEq)]
 struct EditState {
     title: String,
     source_path: Option<String>,
     gain_db: f32,
     normalize: bool,
+    export_format: ExportFormat,
     audio: Option<AudioBuffer>,
 }
 
@@ -39,9 +40,17 @@ impl EditState {
             source_path: document.source_path.clone(),
             gain_db: document.gain_db,
             normalize: document.normalize,
+            export_format: document.export_format,
             audio,
         }
     }
+}
+
+/// Results delivered by background jobs.
+enum JobResult {
+    Loaded { path: PathBuf, audio: AudioBuffer },
+    Processed(AudioBuffer),
+    Batch(BatchReport),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +63,16 @@ enum Action {
     Redo,
     LoadWav,
     ExportWav,
+    PlayPause,
+    Stop,
+    SelectAll,
+    ClearSelection,
+    Trim,
+    Silence,
+    FadeIn,
+    FadeOut,
+    BatchAdd,
+    BatchRun,
     About,
     Settings,
 }
@@ -76,9 +95,17 @@ pub struct MasterCraftApp {
     shell: AppShell,
     host: DocumentHost<Document>,
     edits: History<EditState>,
-    jobs: JobRunner<AudioBuffer>,
+    jobs: JobRunner<JobResult>,
+    playback: Playback,
     pending: Option<PendingAction>,
     gesture_active: bool,
+    selection: Option<Selection>,
+    selection_anchor: Option<usize>,
+    zoom: f32,
+    view_start: f64,
+    batch_paths: Vec<PathBuf>,
+    batch_preset: BatchPreset,
+    fade_ms: u32,
 }
 
 impl MasterCraftApp {
@@ -104,8 +131,16 @@ impl MasterCraftApp {
             host: DocumentHost::new(document, FORMAT, SCHEMA_VERSION, APP_VERSION),
             edits,
             jobs: JobRunner::new(),
+            playback: Playback::new(),
             pending: None,
             gesture_active: false,
+            selection: None,
+            selection_anchor: None,
+            zoom: 1.0,
+            view_start: 0.0,
+            batch_paths: Vec::new(),
+            batch_preset: BatchPreset::default(),
+            fade_ms: 100,
         };
         app.shell.install_theme(&context.egui_ctx);
         if let Some(path) = options.open {
@@ -121,6 +156,7 @@ impl MasterCraftApp {
         document.source_path = state.source_path.clone();
         document.gain_db = state.gain_db;
         document.normalize = state.normalize;
+        document.export_format = state.export_format;
     }
 
     fn finish_gesture(&mut self) {
@@ -130,14 +166,41 @@ impl MasterCraftApp {
         }
     }
 
+    fn frames(&self) -> usize {
+        self.edits
+            .current()
+            .audio
+            .as_ref()
+            .map_or(0, AudioBuffer::frames)
+    }
+
+    fn selected(&self) -> Option<Selection> {
+        self.selection
+            .map(|selection| selection.clamped(self.frames()))
+    }
+
+    fn apply_audio(&mut self, audio: AudioBuffer) {
+        self.finish_gesture();
+        self.playback.set_buffer(&audio);
+        self.edits.apply(|state| state.audio = Some(audio));
+        let frames = self.frames();
+        self.selection = self
+            .selection
+            .map(|selection| selection.clamped(frames))
+            .filter(|selection| !selection.is_empty());
+    }
+
     fn load_project(&mut self, path: PathBuf) {
         match DocumentHost::<Document>::from_file(path.clone(), FORMAT, SCHEMA_VERSION, APP_VERSION)
         {
             Ok(host) => {
                 let document = host.document().clone();
                 self.host = host;
-                // Samples are not part of the JSON envelope: reload the WAV.
                 self.edits = History::new(EditState::from_document(&document, None));
+                self.playback.stop();
+                self.selection = None;
+                self.zoom = 1.0;
+                self.view_start = 0.0;
                 self.pending = None;
                 self.shell.set_status(format!(
                     "Opened {} — reload the WAV to restore audio",
@@ -155,6 +218,10 @@ impl MasterCraftApp {
         let document = Document::default();
         self.edits = History::new(EditState::from_document(&document, None));
         self.host.reset(document);
+        self.playback.stop();
+        self.selection = None;
+        self.zoom = 1.0;
+        self.view_start = 0.0;
         self.pending = None;
         self.shell.set_status("New document");
     }
@@ -248,28 +315,24 @@ impl MasterCraftApp {
         let Some(path) = dialogs::open_project("Load WAV", &["wav"]) else {
             return;
         };
-        match AudioBuffer::load_wav(&path) {
-            Ok(audio) => {
-                let source = path.to_string_lossy().into_owned();
-                let title = path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .map_or_else(|| "Imported audio".to_owned(), str::to_owned);
-                let seconds = audio.duration();
-                self.finish_gesture();
-                self.edits.apply(|state| {
-                    state.audio = Some(audio);
-                    state.source_path = Some(source);
-                    state.title = title;
-                });
-                self.sync_document();
-                self.shell
-                    .set_status(format!("Loaded {} ({seconds:.2} s)", path.display()));
-            }
-            Err(error) => {
-                self.shell
-                    .notify(Tone::Error, "Could not load WAV", error.to_string());
-            }
+        if self.job_running(LOAD_JOB) {
+            return;
+        }
+        let result = self.jobs.spawn(LOAD_JOB, move |context| {
+            let audio = load_wav_with_progress(&path, |fraction| {
+                context
+                    .check_cancelled()
+                    .map_err(|error| error.to_string())?;
+                context
+                    .set_progress_message(fraction, format!("Decoding {:.0}%", fraction * 100.0));
+                Ok(())
+            })
+            .map_err(|error| error.to_string())?;
+            Ok(JobResult::Loaded { path, audio })
+        });
+        if let Err(error) = result {
+            self.shell
+                .notify(Tone::Error, "Could not start load job", error.to_string());
         }
     }
 
@@ -282,14 +345,20 @@ impl MasterCraftApp {
             );
             return;
         };
+        let format = self.edits.current().export_format;
         let default_name = format!("{}.wav", slugify(&self.edits.current().title));
         let Some(path) = dialogs::save_project("Export WAV", &default_name, "wav") else {
             return;
         };
-        match audio.write_wav(&path) {
-            Ok(()) => self
-                .shell
-                .set_status(format!("Exported {}", path.display())),
+        let written = match format {
+            ExportFormat::Float32 => audio.write_wav(&path),
+            ExportFormat::Pcm16 => audio.write_wav_with_format(&path, format),
+        };
+        match written {
+            Ok(()) => {
+                self.shell
+                    .set_status(format!("Exported {} ({})", path.display(), format.label()))
+            }
             Err(error) => {
                 self.shell
                     .notify(Tone::Error, "Could not export WAV", error.to_string());
@@ -314,16 +383,20 @@ impl MasterCraftApp {
             );
             return;
         }
-        if self.jobs.jobs().iter().any(|job| job.label == PROCESS_JOB) {
+        if self.job_running(PROCESS_JOB) {
             self.shell
                 .set_status("A processing job is already running.");
             return;
         }
         let gain_db = self.edits.current().gain_db;
         let normalize = self.edits.current().normalize;
+        let range = self.selected().unwrap_or(Selection {
+            start: 0,
+            end: audio.frames(),
+        });
         let result = self.jobs.spawn(PROCESS_JOB, move |context| {
             let mut output = audio;
-            output.apply_gain(gain_db, normalize, |fraction| {
+            output.apply_gain_range(gain_db, normalize, range.start, range.end, |fraction| {
                 context
                     .check_cancelled()
                     .map_err(|error| error.to_string())?;
@@ -331,7 +404,7 @@ impl MasterCraftApp {
                     .set_progress_message(fraction, format!("Processed {:.0}%", fraction * 100.0));
                 Ok(())
             })?;
-            Ok(output)
+            Ok(JobResult::Processed(output))
         });
         if let Err(error) = result {
             self.shell
@@ -339,20 +412,115 @@ impl MasterCraftApp {
         }
     }
 
+    fn batch_add(&mut self) {
+        let Some(paths) = rfd::FileDialog::new()
+            .set_title("Add WAV files to batch")
+            .add_filter("WAV audio", &["wav"])
+            .pick_files()
+        else {
+            return;
+        };
+        self.batch_paths.extend(paths);
+        self.shell.set_status(format!(
+            "{} file(s) queued for batch",
+            self.batch_paths.len()
+        ));
+    }
+
+    fn batch_run(&mut self) {
+        if self.batch_paths.is_empty() {
+            self.shell.notify(
+                Tone::Warning,
+                "Empty batch",
+                "Add at least one WAV file first.",
+            );
+            return;
+        }
+        if self.job_running(BATCH_JOB) {
+            self.shell.set_status("A batch job is already running.");
+            return;
+        }
+        let paths = self.batch_paths.clone();
+        let preset = self.batch_preset;
+        let format = self.edits.current().export_format;
+        let result = self.jobs.spawn(BATCH_JOB, move |context| {
+            let mut report = BatchReport {
+                processed: 0,
+                failed: Vec::new(),
+            };
+            let total = paths.len();
+            for (index, path) in paths.iter().enumerate() {
+                context
+                    .check_cancelled()
+                    .map_err(|error| error.to_string())?;
+                context.set_progress_message(
+                    index as f32 / total as f32,
+                    format!("File {}/{}: {}", index + 1, total, path.display()),
+                );
+                match batch::process_file(path, &preset, format) {
+                    Ok(_) => report.processed += 1,
+                    Err(error) => report.failed.push((
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("unknown")
+                            .to_owned(),
+                        error,
+                    )),
+                }
+            }
+            context.set_progress(1.0);
+            Ok(JobResult::Batch(report))
+        });
+        if let Err(error) = result {
+            self.shell
+                .notify(Tone::Error, "Could not start batch", error.to_string());
+        }
+    }
+
+    fn job_running(&self, label: &str) -> bool {
+        self.jobs.jobs().iter().any(|job| job.label == label)
+    }
+
     fn poll_jobs(&mut self) {
         for (_, result) in self.jobs.poll() {
             match result {
-                Ok(audio) => {
+                Ok(JobResult::Loaded { path, audio }) => {
+                    let source = path.to_string_lossy().into_owned();
+                    let title = path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .map_or_else(|| "Imported audio".to_owned(), str::to_owned);
+                    let seconds = audio.duration();
                     self.finish_gesture();
-                    self.edits.apply(|state| state.audio = Some(audio));
+                    self.edits.apply(|state| {
+                        state.audio = Some(audio);
+                        state.source_path = Some(source);
+                        state.title = title;
+                    });
+                    self.playback.stop();
+                    self.selection = None;
+                    self.zoom = 1.0;
+                    self.view_start = 0.0;
+                    self.sync_document();
+                    self.shell
+                        .set_status(format!("Loaded {} ({seconds:.2} s)", path.display()));
+                }
+                Ok(JobResult::Processed(audio)) => {
+                    self.apply_audio(audio);
                     self.shell
                         .set_status("Processing applied — undo to restore");
                 }
-                Err(error) if error == "job cancelled" => {
-                    self.shell.set_status("Processing cancelled");
+                Ok(JobResult::Batch(report)) => {
+                    let summary = report.summary();
+                    if report.failed.is_empty() {
+                        self.shell.set_status(summary);
+                    } else {
+                        self.shell
+                            .notify(Tone::Warning, "Batch finished with errors", summary);
+                    }
                 }
                 Err(error) => {
-                    self.shell.notify(Tone::Error, "Processing failed", error);
+                    self.shell.notify(Tone::Error, "Job failed", error);
                 }
             }
         }
@@ -372,6 +540,8 @@ impl MasterCraftApp {
                 self.finish_gesture();
                 if self.edits.undo() {
                     self.sync_document();
+                    self.playback.stop();
+                    self.clamp_selection();
                     self.shell.set_status("Undo");
                 }
             }
@@ -379,14 +549,128 @@ impl MasterCraftApp {
                 self.finish_gesture();
                 if self.edits.redo() {
                     self.sync_document();
+                    self.playback.stop();
+                    self.clamp_selection();
                     self.shell.set_status("Redo");
                 }
             }
             Action::LoadWav => self.load_wav(),
             Action::ExportWav => self.export_wav(),
+            Action::PlayPause => {
+                let Some(audio) = self.edits.current().audio.clone() else {
+                    self.shell
+                        .notify(Tone::Warning, "Nothing to play", "Load audio first.");
+                    return;
+                };
+                if let Err(error) = self.playback.toggle_or_play(&audio) {
+                    self.playback.set_error(error.clone());
+                    self.shell
+                        .notify(Tone::Warning, "Playback unavailable", error);
+                }
+            }
+            Action::Stop => self.playback.stop(),
+            Action::SelectAll => {
+                let frames = self.frames();
+                if frames > 0 {
+                    self.selection = Some(Selection {
+                        start: 0,
+                        end: frames,
+                    });
+                }
+            }
+            Action::ClearSelection => self.selection = None,
+            Action::Trim => {
+                let Some(audio) = self.edits.current().audio.clone() else {
+                    return;
+                };
+                let Some(selection) = self.selected() else {
+                    self.shell.set_status("Select a range first.");
+                    return;
+                };
+                if selection.is_empty() {
+                    return;
+                }
+                self.apply_audio(audio.trim(selection.start, selection.end));
+                self.selection = None;
+                self.shell
+                    .set_status("Trimmed to selection — undo to restore");
+            }
+            Action::Silence => {
+                let Some(selection) = self.selected() else {
+                    self.shell.set_status("Select a range first.");
+                    return;
+                };
+                if selection.is_empty() {
+                    return;
+                }
+                self.finish_gesture();
+                self.playback.stop();
+                self.edits.apply(|state| {
+                    if let Some(audio) = &mut state.audio {
+                        audio.silence_range(selection.start, selection.end);
+                    }
+                });
+                self.shell
+                    .set_status("Selection silenced — undo to restore");
+            }
+            Action::FadeIn | Action::FadeOut => {
+                let Some(selection) = self.selected() else {
+                    self.shell.set_status("Select a range first.");
+                    return;
+                };
+                if selection.is_empty() {
+                    return;
+                }
+                let fade_in = action == Action::FadeIn;
+                let frames = self.fade_frames();
+                self.finish_gesture();
+                self.playback.stop();
+                self.edits.apply(|state| {
+                    if let Some(audio) = &mut state.audio {
+                        audio.fade_range(selection.start, selection.end, frames, fade_in);
+                    }
+                });
+                self.shell.set_status("Fade applied — undo to restore");
+            }
+            Action::BatchAdd => self.batch_add(),
+            Action::BatchRun => self.batch_run(),
             Action::About => self.shell.open_about(),
             Action::Settings => self.shell.open_settings(),
         }
+    }
+
+    fn clamp_selection(&mut self) {
+        let frames = self.frames();
+        self.selection = self
+            .selection
+            .map(|selection| selection.clamped(frames))
+            .filter(|selection| !selection.is_empty());
+    }
+
+    fn fade_frames(&self) -> usize {
+        let rate = self
+            .edits
+            .current()
+            .audio
+            .as_ref()
+            .map_or(0, |audio| audio.sample_rate);
+        batch::fade_frames(self.fade_ms, rate)
+    }
+
+    fn zoom_by(&mut self, factor: f32) {
+        let frames = self.frames();
+        let visible = (frames as f32 / self.zoom).max(1.0);
+        let center =
+            self.view_start * frames.saturating_sub(visible as usize) as f64 + visible as f64 / 2.0;
+        self.zoom = (self.zoom * factor).clamp(1.0, 64.0);
+        let new_visible = (frames as f32 / self.zoom).max(1.0);
+        let max_start = frames.saturating_sub(new_visible as usize);
+        let start = (center - new_visible as f64 / 2.0).max(0.0) as usize;
+        self.view_start = if max_start == 0 {
+            0.0
+        } else {
+            start.min(max_start) as f64 / max_start as f64
+        };
     }
 
     fn handle_shortcuts(&mut self, ui: &egui::Ui) {
@@ -409,6 +693,8 @@ impl MasterCraftApp {
                 Some(Action::Undo)
             } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::Y) {
                 Some(Action::Redo)
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Space) {
+                Some(Action::PlayPause)
             } else {
                 None
             }
@@ -451,6 +737,10 @@ impl MasterCraftApp {
                     action = Some(Action::ExportWav);
                     ui.close();
                 }
+                if ui.button("Add batch files...").clicked() {
+                    action = Some(Action::BatchAdd);
+                    ui.close();
+                }
             });
             ui.menu_button("Edit", |ui| {
                 if ui
@@ -465,6 +755,14 @@ impl MasterCraftApp {
                     .clicked()
                 {
                     action = Some(Action::Redo);
+                    ui.close();
+                }
+                if ui.button("Select all").clicked() {
+                    action = Some(Action::SelectAll);
+                    ui.close();
+                }
+                if ui.button("Clear selection").clicked() {
+                    action = Some(Action::ClearSelection);
                     ui.close();
                 }
             });
@@ -483,6 +781,8 @@ impl MasterCraftApp {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let running = self.jobs.jobs();
         let audio = self.edits.current().audio.clone();
+        let selection = self.selected();
+        let head = self.playback.playhead();
         self.shell.status_bar_with(ui, |ui| {
             for job in running {
                 widgets::job_row(ui, job);
@@ -491,6 +791,25 @@ impl MasterCraftApp {
                 ui.label(RichText::new(format!("{:.2} s", audio.duration())).size(10.5));
                 ui.label(RichText::new(format!("{} Hz", audio.sample_rate)).size(10.5));
                 ui.label(RichText::new(format!("{} ch", audio.channels)).size(10.5));
+                ui.label(
+                    RichText::new(format!(
+                        "{} / {}",
+                        format_time(head.position),
+                        format_time(head.duration)
+                    ))
+                    .size(10.5)
+                    .color(theme::INFO),
+                );
+                if let Some(selection) = selection {
+                    ui.label(
+                        RichText::new(format!(
+                            "sel {:.3} s",
+                            selection.duration(audio.sample_rate)
+                        ))
+                        .size(10.5)
+                        .color(theme::ACCENT),
+                    );
+                }
             } else {
                 ui.label(
                     RichText::new("No audio loaded")
@@ -504,25 +823,42 @@ impl MasterCraftApp {
     fn left_panel(&mut self, ui: &mut egui::Ui) {
         let mut gain = self.edits.current().gain_db;
         let mut normalize = self.edits.current().normalize;
+        let mut format = self.edits.current().export_format;
         let source = self.edits.current().source_path.clone();
         let has_audio = self.edits.current().audio.is_some();
-        let busy = self.jobs.jobs().iter().any(|job| job.label == PROCESS_JOB);
-        let mut load = false;
-        let mut export = false;
-        let mut apply = false;
+        let has_selection = self
+            .selected()
+            .is_some_and(|selection| !selection.is_empty());
+        let busy = self.job_running(PROCESS_JOB);
+        let mut actions = Vec::new();
 
         egui::Panel::left("controls-panel")
             .resizable(true)
-            .default_size(250.0)
-            .min_size(200.0)
+            .default_size(260.0)
+            .min_size(220.0)
             .show(ui, |ui| {
                 widgets::section_label(ui, "Source");
                 ui.add_space(4.0);
                 if ui.button("Load WAV...").clicked() {
-                    load = true;
+                    actions.push(Action::LoadWav);
                 }
                 if ui.button("Export WAV...").clicked() {
-                    export = true;
+                    actions.push(Action::ExportWav);
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Export:");
+                    if ui
+                        .radio(format == ExportFormat::Float32, "Float 32")
+                        .clicked()
+                    {
+                        format = ExportFormat::Float32;
+                    }
+                    if ui.radio(format == ExportFormat::Pcm16, "PCM 16").clicked() {
+                        format = ExportFormat::Pcm16;
+                    }
+                });
+                if format != self.edits.current().export_format {
+                    self.edits.apply(|state| state.export_format = format);
                 }
                 ui.add_space(4.0);
                 if let Some(source) = &source {
@@ -539,6 +875,104 @@ impl MasterCraftApp {
                             .color(theme::FAINT),
                     );
                 }
+
+                ui.separator();
+                widgets::section_label(ui, "Playback");
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let label = if self.playback.is_playing() {
+                        "Pause"
+                    } else {
+                        "Play"
+                    };
+                    if ui.button(label).clicked() {
+                        actions.push(Action::PlayPause);
+                    }
+                    if ui.button("Stop").clicked() {
+                        actions.push(Action::Stop);
+                    }
+                });
+                if let Some(error) = self.playback.error() {
+                    ui.label(RichText::new(error).size(10.0).color(theme::ERROR));
+                }
+                let duration = self.playback.duration() as f32;
+                if duration > 0.0 {
+                    let mut position = self.playback.position() as f32;
+                    let response = ui.add(
+                        egui::Slider::new(&mut position, 0.0..=duration)
+                            .text("Position")
+                            .show_value(false),
+                    );
+                    if response.changed() {
+                        self.playback.seek(f64::from(position));
+                    }
+                }
+
+                ui.separator();
+                widgets::section_label(ui, "Selection");
+                ui.add_space(4.0);
+                if let Some(selection) = self.selected() {
+                    let rate = self
+                        .edits
+                        .current()
+                        .audio
+                        .as_ref()
+                        .map_or(0, |audio| audio.sample_rate);
+                    ui.label(
+                        RichText::new(format!(
+                            "frames {}..{} · {:.3} s",
+                            selection.start,
+                            selection.end,
+                            selection.duration(rate)
+                        ))
+                        .size(10.5),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new("Drag on the waveform to select")
+                            .size(10.0)
+                            .color(theme::FAINT),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("All").clicked() {
+                        actions.push(Action::SelectAll);
+                    }
+                    if ui.button("Clear").clicked() {
+                        actions.push(Action::ClearSelection);
+                    }
+                });
+                if ui
+                    .add_enabled(has_selection, egui::Button::new("Trim to selection"))
+                    .clicked()
+                {
+                    actions.push(Action::Trim);
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(has_selection, egui::Button::new("Silence"))
+                        .clicked()
+                    {
+                        actions.push(Action::Silence);
+                    }
+                    if ui
+                        .add_enabled(has_selection, egui::Button::new("Fade in"))
+                        .clicked()
+                    {
+                        actions.push(Action::FadeIn);
+                    }
+                    if ui
+                        .add_enabled(has_selection, egui::Button::new("Fade out"))
+                        .clicked()
+                    {
+                        actions.push(Action::FadeOut);
+                    }
+                });
+                ui.add(
+                    egui::Slider::new(&mut self.fade_ms, 1..=2_000)
+                        .suffix(" ms")
+                        .text("Fade"),
+                );
 
                 ui.separator();
                 widgets::section_label(ui, "Processing");
@@ -567,31 +1001,53 @@ impl MasterCraftApp {
                         .size(10.0)
                         .color(theme::FAINT),
                 );
-                ui.add_space(6.0);
                 if ui
-                    .add_enabled(has_audio && !busy, egui::Button::new("Apply"))
-                    .on_hover_text("Process the audio in a cancellable background job")
+                    .add_enabled(has_audio && !busy, egui::Button::new("Apply gain"))
                     .clicked()
                 {
-                    apply = true;
+                    self.start_processing();
+                }
+
+                ui.separator();
+                widgets::section_label(ui, "Batch");
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!("{} file(s) queued", self.batch_paths.len()))
+                        .size(10.5)
+                        .color(theme::MUTED),
+                );
+                if ui.button("Add WAV files...").clicked() {
+                    actions.push(Action::BatchAdd);
+                }
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut self.batch_preset.gain_db)
+                            .speed(0.5)
+                            .suffix(" dB"),
+                    );
+                    ui.checkbox(&mut self.batch_preset.normalize, "Normalize");
+                });
+                ui.add(
+                    egui::Slider::new(&mut self.batch_preset.fade_in_ms, 0..=2_000)
+                        .text("Fade in ms"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.batch_preset.fade_out_ms, 0..=2_000)
+                        .text("Fade out ms"),
+                );
+                if ui.button("Run batch").clicked() {
+                    actions.push(Action::BatchRun);
                 }
             });
 
-        if load {
-            self.load_wav();
-        }
-        if export {
-            self.export_wav();
-        }
-        if apply {
-            self.start_processing();
+        for action in actions {
+            self.handle_action(action);
         }
     }
 
     fn central_panel(&mut self, ui: &mut egui::Ui) {
         let mut title = self.edits.current().title.clone();
-        let mut load_wav = false;
-        let mut export_wav = false;
+        let mut actions = Vec::new();
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -600,10 +1056,20 @@ impl MasterCraftApp {
                     if widgets::toolbar_button(ui, "Export WAV", "Export the processed buffer")
                         .clicked()
                     {
-                        export_wav = true;
+                        actions.push(Action::ExportWav);
                     }
                     if widgets::toolbar_button(ui, "Load WAV", "Decode a WAV file").clicked() {
-                        load_wav = true;
+                        actions.push(Action::LoadWav);
+                    }
+                    if widgets::toolbar_button(ui, "Zoom -", "Zoom out").clicked() {
+                        self.zoom_by(0.8);
+                    }
+                    if widgets::toolbar_button(ui, "Zoom +", "Zoom in").clicked() {
+                        self.zoom_by(1.25);
+                    }
+                    if widgets::toolbar_button(ui, "1:1", "Reset zoom").clicked() {
+                        self.zoom = 1.0;
+                        self.view_start = 0.0;
                     }
                 });
             });
@@ -624,6 +1090,18 @@ impl MasterCraftApp {
 
             if self.edits.current().audio.is_some() {
                 self.draw_waveform(ui);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("Zoom {:.1}x", self.zoom))
+                            .size(10.0)
+                            .color(theme::FAINT),
+                    );
+                    ui.label(
+                        RichText::new("Drag to select · click to seek · scroll to zoom")
+                            .size(10.0)
+                            .color(theme::FAINT),
+                    );
+                });
             } else {
                 widgets::empty_state(
                     ui,
@@ -633,29 +1111,42 @@ impl MasterCraftApp {
             }
         });
 
-        if load_wav {
-            self.load_wav();
-        }
-        if export_wav {
-            self.export_wav();
+        for action in actions {
+            self.handle_action(action);
         }
     }
 
-    fn draw_waveform(&self, ui: &mut egui::Ui) {
-        let (rect, _) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 220.0), egui::Sense::hover());
+    fn draw_waveform(&mut self, ui: &mut egui::Ui) {
+        let (rect, response) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), 220.0),
+            egui::Sense::click_and_drag(),
+        );
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, egui::CornerRadius::same(6), theme::SUNKEN);
         let middle = rect.center().y;
-        painter.line_segment(
-            [pos2(rect.left(), middle), pos2(rect.right(), middle)],
-            Stroke::new(1.0, theme::BORDER),
-        );
+
+        let frames = self.frames();
+        if frames == 0 {
+            return;
+        }
+        let visible = (frames as f32 / self.zoom).max(1.0) as usize;
+        let max_start = frames.saturating_sub(visible);
+        let start = (self.view_start * max_start as f64).round() as usize;
+        let (start, visible) = if max_start == 0 {
+            (0, frames)
+        } else {
+            (start.min(max_start), visible)
+        };
+
         let Some(audio) = self.edits.current().audio.as_ref() else {
             return;
         };
         let columns = rect.width().max(1.0) as usize;
-        let peaks = audio.waveform(columns);
+        let peaks = if self.zoom <= 1.0 {
+            audio.waveform(columns)
+        } else {
+            audio.waveform_range(start, start + visible, columns)
+        };
         let half_height = (rect.height() / 2.0 - 6.0).max(0.0);
         let step = rect.width() / columns as f32;
         for (column, &(min, max)) in peaks.iter().enumerate() {
@@ -667,6 +1158,75 @@ impl MasterCraftApp {
                 ],
                 Stroke::new(1.0, theme::ACCENT),
             );
+        }
+        painter.line_segment(
+            [pos2(rect.left(), middle), pos2(rect.right(), middle)],
+            Stroke::new(1.0, theme::BORDER),
+        );
+
+        let frame_at_x = |x: f32| -> usize {
+            let fraction = ((x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            start + (fraction * visible as f32) as usize
+        };
+
+        if let Some(pointer) = response.interact_pointer_pos() {
+            let frame = frame_at_x(pointer.x);
+            if response.drag_started() {
+                self.selection_anchor = Some(frame);
+                self.selection = Some(Selection::new(frame, frame));
+            } else if let Some(anchor) = self.selection_anchor {
+                self.selection = Some(Selection::new(anchor, frame));
+            } else if response.clicked() {
+                self.playback
+                    .seek(frame as f64 / f64::from(audio.sample_rate));
+            }
+        }
+        if response.drag_stopped() {
+            self.selection_anchor = None;
+        }
+
+        if let Some(selection) = self.selected() {
+            let from = selection.start.clamp(start, start + visible);
+            let to = selection.end.clamp(start, start + visible);
+            let left = rect.left() + (from - start) as f32 / visible as f32 * rect.width();
+            let right = rect.left() + (to - start) as f32 / visible as f32 * rect.width();
+            painter.rect_filled(
+                Rect::from_min_max(pos2(left, rect.top()), pos2(right, rect.bottom())),
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(232, 87, 63, 48),
+            );
+            for x in [left, right] {
+                painter.line_segment(
+                    [pos2(x, rect.top()), pos2(x, rect.bottom())],
+                    Stroke::new(1.5, theme::ACCENT_LIGHT),
+                );
+                painter.text(
+                    pos2(x, rect.bottom() - 10.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    format!("{:.2}s", x as f64 / f64::from(audio.sample_rate)),
+                    egui::FontId::proportional(9.0),
+                    theme::MUTED,
+                );
+            }
+        }
+
+        let position = self.playback.position();
+        if position > 0.0 {
+            let frame = (position * f64::from(audio.sample_rate)) as usize;
+            if (start..start + visible).contains(&frame) {
+                let x = rect.left() + (frame - start) as f32 / visible as f32 * rect.width();
+                painter.line_segment(
+                    [pos2(x, rect.top()), pos2(x, rect.bottom())],
+                    Stroke::new(1.5, theme::SUCCESS),
+                );
+            }
+        }
+
+        if response.hovered() {
+            let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+            if scroll.abs() > 0.0 {
+                self.zoom_by(if scroll > 0.0 { 1.1 } else { 0.9 });
+            }
         }
     }
 
@@ -707,6 +1267,7 @@ impl MasterCraftApp {
 impl eframe::App for MasterCraftApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_jobs();
+        self.playback.tick();
         self.handle_shortcuts(ui);
         self.top_bar(ui);
         self.status_bar(ui);
@@ -747,6 +1308,7 @@ mod tests {
             source_path: None,
             gain_db,
             normalize,
+            export_format: ExportFormat::Float32,
             audio,
         }
     }
@@ -764,6 +1326,36 @@ mod tests {
         assert_eq!(edits.current().gain_db, 0.0);
         assert!(edits.redo());
         assert_eq!(edits.current().gain_db, -6.0);
+    }
+
+    #[test]
+    fn trim_and_fade_are_one_undo_step_each() {
+        let audio = AudioBuffer {
+            samples: vec![1.0, 1.0, 1.0, 1.0],
+            sample_rate: 48_000,
+            channels: 1,
+        };
+        let mut edits = History::new(state(0.0, false, Some(audio.clone())));
+        let trimmed = audio.trim(1, 3);
+        edits.apply(|edit| edit.audio = Some(trimmed));
+        assert_eq!(
+            edits.current().audio.as_ref().expect("audio").samples,
+            vec![1.0, 1.0]
+        );
+
+        let mut faded = audio.clone();
+        faded.fade_range(0, 4, 2, true);
+        edits.apply(|edit| edit.audio = Some(faded));
+        assert!(edits.undo());
+        assert_eq!(
+            edits.current().audio.as_ref().expect("audio").samples,
+            vec![1.0, 1.0]
+        );
+        assert!(edits.undo());
+        assert_eq!(
+            edits.current().audio.as_ref().expect("audio").samples.len(),
+            4
+        );
     }
 
     #[test]
