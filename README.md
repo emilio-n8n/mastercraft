@@ -12,8 +12,12 @@ desktop foundation.
 ## Features
 
 - Native Rust desktop UI (egui/eframe), no web runtime.
+- Load mono/stereo WAV files (8/16/24/32-bit integer and 32-bit float).
+- Waveform display drawn with min/max peaks per screen column.
+- Gain in dB and peak normalisation, processed in a cancellable background job.
+- Export to 32-bit float WAV, with a lossless round trip for exported files.
+- Bounded undo/redo of editing settings **and** processed audio.
 - Versioned JSON project files with atomic saves.
-- Bounded undo/redo through the shared document history.
 - Background jobs with progress and cooperative cancellation.
 - Recent files and persisted preferences.
 - Offline-first: no account, no telemetry, no network required.
@@ -27,10 +31,16 @@ cargo run --release -- --open project.json
 
 Without arguments the application opens an empty document.
 
-- `--sample` opens the built-in demonstration document.
-- `--open <file>` opens a project.
+- `--sample` generates a two-second 440 Hz sine buffer (no external asset).
+- `--open <file>` opens a project. Audio samples are not stored in the JSON
+  project, so the source WAV must be loaded again after opening.
 - `--version` prints the version.
 - `--help` prints usage.
+
+Use **Load WAV...** to decode a file, adjust the gain slider or enable
+**Normalize to 0 dBFS**, then press **Apply**. Progress and a **Cancel** button
+appear in the status bar. Normalisation scales the peak to exactly 1.0 and
+overrides the gain slider; the output is always clamped to avoid clipping.
 
 ## Build and test
 
@@ -46,9 +56,9 @@ Linux windowing development packages are installed by the CI workflow.
 
 ```text
 src/main.rs       CLI and window startup
-src/app.rs        UI, menus and lifecycle
-src/document.rs   application document model
-src/...           domain modules
+src/app.rs        UI, menus, actions and lifecycle
+src/audio.rs      WAV I/O, waveform, gain and normalisation (pure logic)
+src/document.rs   persisted document model
 ```
 
 The application depends on pinned CraftKit crates from Git. Keep the tag in
@@ -67,7 +77,9 @@ Projects are JSON envelopes:
 }
 ```
 
-The application owns the `document` schema and its migrations. A newer
+Only `title`, `source_path`, `gain_db` and `normalize` are persisted. Audio
+samples stay in memory and are never written to the JSON envelope. The
+application owns the `document` schema and its migrations; a newer
 `schema_version` is rejected instead of being silently misread.
 
 ## Licence

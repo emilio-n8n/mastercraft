@@ -13,4 +13,9 @@ craftkit-core = { git = "https://github.com/emilio-n8n/craftkit", tag = "v0.1.0"
 craftkit-io = { git = "https://github.com/emilio-n8n/craftkit", tag = "v0.1.0" }
 craftkit-jobs = { git = "https://github.com/emilio-n8n/craftkit", tag = "v0.1.0" }
 craftkit-ui = { git = "https://github.com/emilio-n8n/craftkit", tag = "v0.1.0" }
+hound = "3"
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"

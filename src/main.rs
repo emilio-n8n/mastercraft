@@ -1,8 +1,9 @@
-//! CraftKit reference application entry point.
+//! MasterCraft entry point: CLI, window options and eframe startup.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod audio;
 mod document;
 
 use craftkit_ui::cli::{self, CliAction};
@@ -23,7 +24,7 @@ fn main() -> craftkit_ui::eframe::Result<()> {
                 "{}",
                 cli::help_text(
                     "mastercraft",
-                    "CraftKit demo — notes application and reference implementation"
+                    "MasterCraft — audio restoration with waveform editing and WAV export"
                 )
             );
             return Ok(());
@@ -36,7 +37,7 @@ fn main() -> craftkit_ui::eframe::Result<()> {
     };
 
     run_native(WindowOptions::new("MasterCraft"), move |context| {
-        let app = app::DemoApp::new(context, options);
+        let app = app::MasterCraftApp::new(context, options);
         Ok(Box::new(app) as Box<dyn craftkit_ui::eframe::App>)
     })
 }
